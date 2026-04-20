@@ -5,223 +5,285 @@ Fetches surface (10m) and 850mb (smoke transport) wind data.
 """
 
 import json
-import struct
 import os
 import sys
 from datetime import datetime, timedelta, timezone
 import requests
-import numpy as np
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# NOAA NOMADS GFS filter endpoint
 NOMADS_BASE = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_1p00.pl"
 
-def get_latest_gfs_cycle():
-    """Determine the most recent GFS cycle that should be available.
-    GFS runs at 00z, 06z, 12z, 18z. Data becomes available ~3.5 hours after.
-    """
+def get_gfs_cycles():
+    """Yield recent GFS cycles to try, newest first."""
     now = datetime.now(timezone.utc)
-    # Try cycles from most recent backwards
-    for hours_ago in range(0, 24, 6):
-        cycle_time = now - timedelta(hours=hours_ago + 4)  # 4hr processing delay
+    for hours_ago in range(4, 30, 6):
+        cycle_time = now - timedelta(hours=hours_ago)
         cycle_hour = (cycle_time.hour // 6) * 6
         cycle_dt = cycle_time.replace(hour=cycle_hour, minute=0, second=0, microsecond=0)
         yield cycle_dt
 
-def download_gfs_grib(cycle_dt, level_param, var_params, output_path):
-    """Download a filtered GFS GRIB2 file from NOMADS."""
+def download_grib(cycle_dt, level_param, output_path):
+    """Download filtered GFS GRIB2 from NOMADS."""
     date_str = cycle_dt.strftime("%Y%m%d")
     hour_str = cycle_dt.strftime("%H")
-    
     params = {
         "file": f"gfs.t{hour_str}z.pgrb2.1p00.f000",
         level_param: "on",
+        "var_UGRD": "on",
+        "var_VGRD": "on",
         "dir": f"/gfs.{date_str}/{hour_str}/atmos"
     }
-    for var in var_params:
-        params[var] = "on"
-    
-    url = NOMADS_BASE
-    print(f"  Downloading: cycle={date_str}/{hour_str}z level={level_param}")
-    
+    print(f"  Trying cycle {date_str}/{hour_str}z...")
     try:
-        resp = requests.get(url, params=params, timeout=30)
-        if resp.status_code == 200 and len(resp.content) > 100:
+        resp = requests.get(NOMADS_BASE, params=params, timeout=30)
+        if resp.status_code == 200 and len(resp.content) > 500:
             with open(output_path, "wb") as f:
                 f.write(resp.content)
-            print(f"  Downloaded {len(resp.content)} bytes")
+            print(f"  Downloaded {len(resp.content):,} bytes")
             return True
-        else:
-            print(f"  HTTP {resp.status_code}, size={len(resp.content)}")
-            return False
+        print(f"  HTTP {resp.status_code}, {len(resp.content)} bytes — skipping")
     except Exception as e:
         print(f"  Error: {e}")
-        return False
+    return False
 
-def parse_grib2_simple(filepath):
-    """
-    Simple GRIB2 parser that extracts the data values from a GFS 1-degree file.
-    This handles the specific case of GFS 1x1 degree global grid.
-    Returns list of dicts with header info and data arrays.
-    """
-    records = []
-    with open(filepath, "rb") as f:
-        data = f.read()
-    
-    pos = 0
-    while pos < len(data) - 4:
-        # Find GRIB marker
-        if data[pos:pos+4] != b"GRIB":
-            pos += 1
-            continue
+def grib2_to_json_cfgrib(grib_path):
+    """Convert GRIB2 to JSON using cfgrib (xarray backend)."""
+    try:
+        import cfgrib
+        import numpy as np
         
-        # Section 0: Indicator
-        edition = data[pos+7]
-        if edition != 2:
-            pos += 1
-            continue
+        ds = cfgrib.open_datasets(grib_path)
         
-        msg_len = struct.unpack(">Q", data[pos+8:pos+16])[0]
-        msg_data = data[pos:pos+msg_len]
+        u_data = v_data = None
+        header = {}
         
-        try:
-            record = parse_grib2_message(msg_data)
-            if record:
-                records.append(record)
-        except Exception as e:
-            print(f"  Warning: failed to parse GRIB2 message at offset {pos}: {e}")
+        for d in ds:
+            for var_name in d.data_vars:
+                var = d[var_name]
+                if 'u' in var_name.lower() or var_name in ('u10', 'u'):
+                    u_data = var.values.flatten()
+                    lats = var.coords['latitude'].values
+                    lons = var.coords['longitude'].values
+                    header = {
+                        "nx": len(lons),
+                        "ny": len(lats),
+                        "lo1": float(lons[0]),
+                        "la1": float(lats[0]),
+                        "lo2": float(lons[-1]),
+                        "la2": float(lats[-1]),
+                        "dx": float(abs(lons[1] - lons[0])),
+                        "dy": float(abs(lats[1] - lats[0]))
+                    }
+                elif 'v' in var_name.lower() or var_name in ('v10', 'v'):
+                    v_data = var.values.flatten()
         
-        pos += msg_len
-    
-    return records
-
-def parse_grib2_message(msg):
-    """Parse a single GRIB2 message. Extracts grid info and data values."""
-    # We need sections 3 (grid), 4 (product), 5 (data rep), 6 (bitmap), 7 (data)
-    pos = 16  # Skip section 0
-    
-    nx = ny = 0
-    lo1 = la1 = lo2 = la2 = dx = dy = 0
-    param_cat = param_num = level_type = level_value = 0
-    ref_time = ""
-    values = None
-    
-    while pos < len(msg) - 4:
-        if msg[pos:pos+4] == b"7777":
-            break
-        
-        sec_len = struct.unpack(">I", msg[pos:pos+4])[0]
-        sec_num = msg[pos+4]
-        
-        if sec_num == 1:
-            # Identification section
-            year = struct.unpack(">H", msg[pos+12:pos+14])[0]
-            month, day, hour, minute, second = msg[pos+14], msg[pos+15], msg[pos+16], msg[pos+17], msg[pos+18]
-            ref_time = f"{year:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{second:02d}.000Z"
-        
-        elif sec_num == 3:
-            # Grid definition
-            nx = struct.unpack(">I", msg[pos+30:pos+34])[0]
-            ny = struct.unpack(">I", msg[pos+34:pos+38])[0]
-            la1 = struct.unpack(">I", msg[pos+46:pos+50])[0] / 1e6
-            lo1 = struct.unpack(">I", msg[pos+50:pos+54])[0] / 1e6
-            la2 = struct.unpack(">I", msg[pos+55:pos+59])[0] / 1e6
-            lo2 = struct.unpack(">I", msg[pos+59:pos+63])[0] / 1e6
-            dx = struct.unpack(">I", msg[pos+63:pos+67])[0] / 1e6
-            dy = struct.unpack(">I", msg[pos+67:pos+71])[0] / 1e6
-        
-        elif sec_num == 4:
-            # Product definition
-            param_cat = msg[pos+9]
-            param_num = msg[pos+10]
-            level_type = msg[pos+22]
-            level_value = struct.unpack(">I", msg[pos+23:pos+27])[0]
-        
-        elif sec_num == 5:
-            # Data representation
-            num_points = struct.unpack(">I", msg[pos+5:pos+9])[0]
-            template = struct.unpack(">H", msg[pos+9:pos+11])[0]
-            
-            if template == 0:  # Simple packing
-                ref_val = struct.unpack(">f", msg[pos+11:pos+15])[0]
-                bin_scale = struct.unpack(">h", msg[pos+15:pos+17])[0]
-                dec_scale = struct.unpack(">h", msg[pos+17:pos+19])[0]
-                nbits = msg[pos+19]
-                
-                # Store for section 7
-                packing = {"ref": ref_val, "bscale": bin_scale, "dscale": dec_scale, "nbits": nbits, "npoints": num_points}
-        
-        elif sec_num == 7:
-            # Data section
-            if 'packing' in dir() and packing and packing["nbits"] > 0:
-                raw = msg[pos+5:pos+sec_len]
-                nbits = packing["nbits"]
-                ref = packing["ref"]
-                bs = 2.0 ** packing["bscale"]
-                ds = 10.0 ** (-packing["dscale"])
-                
-                # Unpack bit-packed integers
-                values = []
-                bit_pos = 0
-                for _ in range(packing["npoints"]):
-                    byte_idx = bit_pos // 8
-                    bit_offset = bit_pos % 8
-                    
-                    # Read enough bytes
-                    raw_val = 0
-                    bits_remaining = nbits
-                    while bits_remaining > 0:
-                        if byte_idx >= len(raw):
-                            raw_val = 0
-                            break
-                        available = 8 - bit_offset
-                        take = min(available, bits_remaining)
-                        mask = ((1 << take) - 1) << (available - take)
-                        raw_val = (raw_val << take) | ((raw[byte_idx] & mask) >> (available - take))
-                        bits_remaining -= take
-                        bit_offset = 0
-                        byte_idx += 1
-                    
-                    values.append((ref + raw_val * bs) * ds)
-                    bit_pos += nbits
-        
-        pos += sec_len
-    
-    if values and nx > 0:
-        # Determine parameter name
-        param_name = "unknown"
-        if param_cat == 2 and param_num == 2:
-            param_name = "U-component_of_wind"
-        elif param_cat == 2 and param_num == 3:
-            param_name = "V-component_of_wind"
-        
-        return {
-            "header": {
-                "discipline": 0,
-                "parameterCategory": param_cat,
-                "parameterNumber": param_num,
-                "parameterNumberName": param_name,
-                "parameterUnit": "m.s-1",
-                "refTime": ref_time,
-                "surface1Type": level_type,
-                "surface1Value": level_value,
-                "nx": nx,
-                "ny": ny,
-                "lo1": lo1,
-                "la1": la1,
-                "lo2": lo2,
-                "la2": la2,
-                "dx": dx,
-                "dy": dy
-            },
-            "data": [round(v, 2) for v in values]
-        }
-    
+        if u_data is not None and v_data is not None:
+            return [
+                {"header": {**header, "parameterNumber": 2, "parameterNumberName": "U-component_of_wind", "parameterUnit": "m.s-1"},
+                 "data": [round(float(x), 2) for x in u_data]},
+                {"header": {**header, "parameterNumber": 3, "parameterNumberName": "V-component_of_wind", "parameterUnit": "m.s-1"},
+                 "data": [round(float(x), 2) for x in v_data]}
+            ]
+    except ImportError:
+        print("  cfgrib not available")
+    except Exception as e:
+        print(f"  cfgrib error: {e}")
     return None
 
-def fetch_level(level_param, var_params, output_name, level_label):
+def grib2_to_json_eccodes(grib_path):
+    """Convert GRIB2 to JSON using eccodes."""
+    try:
+        import eccodes
+        
+        records = []
+        with open(grib_path, "rb") as f:
+            while True:
+                msgid = eccodes.codes_grib_new_from_file(f)
+                if msgid is None:
+                    break
+                try:
+                    param_name = eccodes.codes_get(msgid, "shortName")
+                    nx = eccodes.codes_get(msgid, "Ni")
+                    ny = eccodes.codes_get(msgid, "Nj")
+                    lo1 = eccodes.codes_get(msgid, "longitudeOfFirstGridPointInDegrees")
+                    la1 = eccodes.codes_get(msgid, "latitudeOfFirstGridPointInDegrees")
+                    lo2 = eccodes.codes_get(msgid, "longitudeOfLastGridPointInDegrees")
+                    la2 = eccodes.codes_get(msgid, "latitudeOfLastGridPointInDegrees")
+                    dx = eccodes.codes_get(msgid, "iDirectionIncrementInDegrees")
+                    dy = eccodes.codes_get(msgid, "jDirectionIncrementInDegrees")
+                    values = eccodes.codes_get_values(msgid)
+                    
+                    param_num = 2 if param_name in ("10u", "u") else 3 if param_name in ("10v", "v") else -1
+                    if param_num > 0:
+                        records.append({
+                            "header": {
+                                "parameterNumber": param_num,
+                                "parameterNumberName": f"{'U' if param_num==2 else 'V'}-component_of_wind",
+                                "parameterUnit": "m.s-1",
+                                "nx": nx, "ny": ny,
+                                "lo1": lo1, "la1": la1, "lo2": lo2, "la2": la2,
+                                "dx": dx, "dy": dy
+                            },
+                            "data": [round(float(v), 2) for v in values]
+                        })
+                finally:
+                    eccodes.codes_release(msgid)
+        
+        if len(records) >= 2:
+            u = next((r for r in records if r["header"]["parameterNumber"] == 2), None)
+            v = next((r for r in records if r["header"]["parameterNumber"] == 3), None)
+            if u and v:
+                return [u, v]
+    except ImportError:
+        print("  eccodes not available")
+    except Exception as e:
+        print(f"  eccodes error: {e}")
+    return None
+
+def grib2_to_json_wgrib2(grib_path):
+    """Convert GRIB2 to JSON using wgrib2 command line tool."""
+    import subprocess
+    import csv
+    import io
+    import numpy as np
+    
+    try:
+        # Check if wgrib2 is available
+        subprocess.run(["wgrib2", "--version"], capture_output=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print("  wgrib2 not available")
+        return None
+    
+    try:
+        result = subprocess.run(
+            ["wgrib2", grib_path, "-csv", "/dev/stdout"],
+            capture_output=True, text=True, timeout=30
+        )
+        
+        if result.returncode != 0:
+            print(f"  wgrib2 error: {result.stderr}")
+            return None
+        
+        # Parse CSV output
+        reader = csv.reader(io.StringIO(result.stdout))
+        u_vals = {}
+        v_vals = {}
+        
+        for row in reader:
+            if len(row) < 7:
+                continue
+            var_name = row[2].strip().strip('"')
+            lat = float(row[4])
+            lon = float(row[5])
+            val = float(row[6])
+            
+            key = (lat, lon)
+            if "UGRD" in var_name:
+                u_vals[key] = val
+            elif "VGRD" in var_name:
+                v_vals[key] = val
+        
+        if not u_vals or not v_vals:
+            print("  No UGRD/VGRD data found in wgrib2 output")
+            return None
+        
+        # Build grid
+        all_lats = sorted(set(k[0] for k in u_vals.keys()), reverse=True)
+        all_lons = sorted(set(k[1] for k in u_vals.keys()))
+        ny, nx = len(all_lats), len(all_lons)
+        
+        u_data = []
+        v_data = []
+        for lat in all_lats:
+            for lon in all_lons:
+                u_data.append(round(u_vals.get((lat, lon), 0), 2))
+                v_data.append(round(v_vals.get((lat, lon), 0), 2))
+        
+        header = {
+            "nx": nx, "ny": ny,
+            "lo1": all_lons[0], "la1": all_lats[0],
+            "lo2": all_lons[-1], "la2": all_lats[-1],
+            "dx": round(all_lons[1] - all_lons[0], 2) if nx > 1 else 1,
+            "dy": round(all_lats[0] - all_lats[1], 2) if ny > 1 else 1
+        }
+        
+        return [
+            {"header": {**header, "parameterNumber": 2, "parameterNumberName": "U-component_of_wind", "parameterUnit": "m.s-1"}, "data": u_data},
+            {"header": {**header, "parameterNumber": 3, "parameterNumberName": "V-component_of_wind", "parameterUnit": "m.s-1"}, "data": v_data}
+        ]
+    except Exception as e:
+        print(f"  wgrib2 conversion error: {e}")
+    return None
+
+def grib2_to_json_pygrib(grib_path):
+    """Convert GRIB2 to JSON using pygrib."""
+    try:
+        import pygrib
+        
+        grbs = pygrib.open(grib_path)
+        records = []
+        
+        for grb in grbs:
+            if grb.shortName in ('10u', '10v', 'u', 'v'):
+                values = grb.values.flatten()
+                lats, lons = grb.latlons()
+                lat_col = lats[:, 0]
+                lon_row = lons[0, :]
+                
+                param_num = 2 if grb.shortName in ('10u', 'u') else 3
+                records.append({
+                    "header": {
+                        "parameterNumber": param_num,
+                        "parameterNumberName": f"{'U' if param_num==2 else 'V'}-component_of_wind",
+                        "parameterUnit": "m.s-1",
+                        "nx": len(lon_row), "ny": len(lat_col),
+                        "lo1": float(lon_row[0]), "la1": float(lat_col[0]),
+                        "lo2": float(lon_row[-1]), "la2": float(lat_col[-1]),
+                        "dx": float(abs(lon_row[1] - lon_row[0])),
+                        "dy": float(abs(lat_col[1] - lat_col[0]))
+                    },
+                    "data": [round(float(v), 2) for v in values]
+                })
+        
+        grbs.close()
+        
+        if len(records) >= 2:
+            u = next((r for r in records if r["header"]["parameterNumber"] == 2), None)
+            v = next((r for r in records if r["header"]["parameterNumber"] == 3), None)
+            if u and v:
+                return [u, v]
+    except ImportError:
+        print("  pygrib not available")
+    except Exception as e:
+        print(f"  pygrib error: {e}")
+    return None
+
+def convert_grib_to_json(grib_path, json_path):
+    """Try multiple GRIB2 conversion methods."""
+    print(f"  Converting GRIB2 to JSON...")
+    
+    # Try each method in order of preference
+    for name, func in [
+        ("cfgrib", grib2_to_json_cfgrib),
+        ("eccodes", grib2_to_json_eccodes),
+        ("pygrib", grib2_to_json_pygrib),
+        ("wgrib2", grib2_to_json_wgrib2),
+    ]:
+        print(f"  Trying {name}...")
+        result = func(grib_path)
+        if result:
+            with open(json_path, "w") as f:
+                json.dump(result, f, separators=(",", ":"))
+            size_kb = os.path.getsize(json_path) / 1024
+            print(f"  ✓ Converted with {name}: {size_kb:.0f} KB, grid {result[0]['header']['nx']}×{result[0]['header']['ny']}")
+            return True
+    
+    print(f"  ✗ All conversion methods failed")
+    return False
+
+def fetch_level(level_param, output_name, level_label):
     """Fetch and convert one level of wind data."""
     print(f"\n{'='*50}")
     print(f"Fetching {level_label} wind...")
@@ -229,50 +291,21 @@ def fetch_level(level_param, var_params, output_name, level_label):
     grib_path = os.path.join(DATA_DIR, f"{output_name}.grib2")
     json_path = os.path.join(DATA_DIR, f"{output_name}.json")
     
-    for cycle_dt in get_latest_gfs_cycle():
-        if download_gfs_grib(cycle_dt, level_param, var_params, grib_path):
-            # Parse GRIB2
-            print(f"  Parsing GRIB2...")
-            records = parse_grib2_simple(grib_path)
-            
-            if len(records) >= 2:
-                # Find U and V components
-                u_rec = next((r for r in records if r["header"]["parameterNumber"] == 2), None)
-                v_rec = next((r for r in records if r["header"]["parameterNumber"] == 3), None)
-                
-                if u_rec and v_rec:
-                    output = [u_rec, v_rec]
-                    with open(json_path, "w") as f:
-                        json.dump(output, f, separators=(",", ":"))
-                    
-                    size_kb = os.path.getsize(json_path) / 1024
-                    print(f"  ✓ Saved {json_path} ({size_kb:.0f} KB)")
-                    print(f"    Grid: {u_rec['header']['nx']}×{u_rec['header']['ny']}")
-                    print(f"    Ref time: {u_rec['header']['refTime']}")
-                    
-                    # Clean up GRIB
-                    os.remove(grib_path)
-                    return True
-                else:
-                    print(f"  Could not find U/V components in {len(records)} records")
+    for cycle_dt in get_gfs_cycles():
+        if download_grib(cycle_dt, level_param, grib_path):
+            if convert_grib_to_json(grib_path, json_path):
+                # Clean up GRIB2 file — don't commit binary files
+                os.remove(grib_path)
+                return True
             else:
-                print(f"  Only {len(records)} records parsed (need 2)")
-        
-        print(f"  Trying older cycle...")
+                print("  Conversion failed, trying older cycle...")
     
-    print(f"  ✗ Failed to fetch {level_label} wind data")
+    # Clean up any leftover GRIB2 file
+    if os.path.exists(grib_path):
+        os.remove(grib_path)
+    
+    print(f"  ✗ Failed to fetch {level_label}")
     return False
-
-def write_metadata(results):
-    """Write a metadata file with timestamps."""
-    meta = {
-        "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "levels": results
-    }
-    meta_path = os.path.join(DATA_DIR, "meta.json")
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
-    print(f"\n✓ Metadata written to {meta_path}")
 
 def main():
     print("=" * 60)
@@ -280,29 +313,44 @@ def main():
     print(f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print("=" * 60)
     
+    # Install available GRIB libraries
+    import subprocess
+    print("\nInstalling GRIB libraries...")
+    for pkg in ["cfgrib", "eccodes", "pygrib"]:
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", pkg, "--quiet"], 
+                         capture_output=True, timeout=60)
+            print(f"  ✓ {pkg}")
+        except Exception:
+            print(f"  ✗ {pkg} (skipped)")
+    
     results = {}
     
-    # Surface wind (10m above ground)
-    if fetch_level("lev_10_m_above_ground", ["var_UGRD", "var_VGRD"],
-                    "current-wind-surface", "Surface (10m)"):
+    if fetch_level("lev_10_m_above_ground", "current-wind-surface", "Surface (10m)"):
         results["surface"] = "ok"
     else:
         results["surface"] = "failed"
     
-    # 850mb wind (for smoke transport)
-    if fetch_level("lev_850_mb", ["var_UGRD", "var_VGRD"],
-                    "current-wind-850mb", "850mb (smoke transport)"):
+    if fetch_level("lev_850_mb", "current-wind-850mb", "850mb (smoke)"):
         results["850mb"] = "ok"
     else:
         results["850mb"] = "failed"
     
-    write_metadata(results)
+    # Write metadata
+    meta = {"updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "levels": results}
+    with open(os.path.join(DATA_DIR, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
     
-    print("\n" + "=" * 60)
-    print("Done!")
+    print(f"\n{'='*60}")
+    print("Results:")
     for level, status in results.items():
-        icon = "✓" if status == "ok" else "✗"
-        print(f"  {icon} {level}: {status}")
+        print(f"  {'✓' if status=='ok' else '✗'} {level}: {status}")
+    
+    # Verify no GRIB2 files are left (they shouldn't be committed)
+    for f in os.listdir(DATA_DIR):
+        if f.endswith('.grib2'):
+            os.remove(os.path.join(DATA_DIR, f))
+            print(f"  Cleaned up: {f}")
 
 if __name__ == "__main__":
     main()
