@@ -11,7 +11,7 @@ permissions:
 jobs:
   update-wind:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -22,9 +22,14 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
-          pip install requests numpy
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libeccodes-dev
+
+      - name: Install Python dependencies
+        run: |
+          pip install requests numpy cfgrib eccodes
 
       - name: Fetch and convert GFS wind data
         run: python fetch_gfs.py
