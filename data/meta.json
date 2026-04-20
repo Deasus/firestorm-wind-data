@@ -1,7 +1,7 @@
 {
-  "updated": "2026-04-19T23:57:01Z",
+  "updated": "2026-04-20T00:27:52Z",
   "levels": {
-    "surface": "failed",
-    "850mb": "failed"
+    "surface": "ok",
+    "850mb": "ok"
   }
 }
