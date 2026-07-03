@@ -1,7 +1,16 @@
 """
 Fetch latest GFS wind data from NOAA NOMADS and convert to JSON.
 Outputs JSON in the same format as nullschool/cambecc earth project.
-Fetches surface (10m) and 850mb (smoke transport) wind data.
+
+Levels fetched:
+  • surface (10 m AGL) — near-surface wind for fire behavior
+  • 850 mb  (~5,000 ft AMSL) — smoke transport, low-level jets
+  • 700 mb  (~10,000 ft AMSL) — plume rise, mid-level flow
+  • 500 mb  (~18,000 ft AMSL) — long-range spotting, upper flow
+
+All levels are queried by the frontend's query_wind tool via a level_mb
+parameter. Fire behavior analysts use the aloft levels for smoke
+transport forecast and long-range spotting hazard.
 """
 
 import json
@@ -330,14 +339,34 @@ def main():
         results["surface"] = "ok"
     else:
         results["surface"] = "failed"
-    
-    if fetch_level("lev_850_mb", "current-wind-850mb", "850mb (smoke)"):
+
+    if fetch_level("lev_850_mb", "current-wind-850mb", "850mb (~5,000 ft AMSL, smoke)"):
         results["850mb"] = "ok"
     else:
         results["850mb"] = "failed"
-    
+
+    if fetch_level("lev_700_mb", "current-wind-700mb", "700mb (~10,000 ft AMSL, plume rise)"):
+        results["700mb"] = "ok"
+    else:
+        results["700mb"] = "failed"
+
+    if fetch_level("lev_500_mb", "current-wind-500mb", "500mb (~18,000 ft AMSL, long-range spotting)"):
+        results["500mb"] = "ok"
+    else:
+        results["500mb"] = "failed"
+
     # Write metadata
-    meta = {"updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "levels": results}
+    meta = {
+        "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "levels": results,
+        "level_details": {
+            "surface": {"height_agl_m": 10, "typical_use": "fire behavior / surface flow"},
+            "850mb":   {"altitude_amsl_ft": 5000,  "typical_use": "smoke transport, low-level jet"},
+            "700mb":   {"altitude_amsl_ft": 10000, "typical_use": "plume rise, mid-level flow"},
+            "500mb":   {"altitude_amsl_ft": 18000, "typical_use": "long-range spotting, upper flow"},
+        },
+        "source": "NOAA NOMADS GFS 1p00 (analysis f000)",
+    }
     with open(os.path.join(DATA_DIR, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
     
