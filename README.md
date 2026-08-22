@@ -24,7 +24,7 @@ Every 3 hours, a GitHub Action:
 Fetch the raw JSON from GitHub:
 
 ```javascript
-fetch('https://raw.githubusercontent.com/YOUR_USER/firestorm-wind-data/main/data/current-wind-surface.json')
+fetch('https://raw.githubusercontent.com/Deasus/firestorm-wind-data/main/data/current-wind-surface.json')
   .then(r => r.json())
   .then(data => {
     // data[0] = U-component, data[1] = V-component
