@@ -1,0 +1,54 @@
+name: update-ecmwf
+
+# 2026-10-16 — ECMWF IFS 0.25 degree 10 m wind for the fire regions outside the US.
+# HRRR stays authoritative in CONUS/Alaska, GFS 1 degree everywhere else (+ aloft levels).
+# ECMWF publishes 00/06/12/18 UTC runs; polling every 3 h always picks up the newest.
+
+on:
+  schedule:
+    - cron: '20 */3 * * *'
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'fetch_ecmwf.py'
+      - '.github/workflows/update-ecmwf.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-ecmwf
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: install deps
+        run: python -m pip install --quiet ecmwf-opendata eccodes numpy
+
+      - name: fetch ECMWF regional wind
+        run: python fetch_ecmwf.py
+
+      # Single-commit branch, force-pushed: ~4 MB per run never accumulates in main's
+      # history. The client reads raw.githubusercontent.com/<repo>/ecmwf/<file>.
+      - name: publish to branch ecmwf
+        run: |
+          export GIT_INDEX_FILE="$(mktemp)"
+          rm -f "$GIT_INDEX_FILE"
+          git --work-tree=data/ecmwf add -A .
+          tree=$(git write-tree)
+          commit=$(git -c user.name='github-actions[bot]' -c user.email='github-actions[bot]@users.noreply.github.com' \
+                   commit-tree "$tree" -m "ECMWF $(python -c "import json;print(json.load(open('data/ecmwf/meta.json'))['ref_time'])")")
+          git push --force --quiet origin "${commit}:refs/heads/ecmwf"
+          echo "published $(ls data/ecmwf | wc -l) files to branch ecmwf (${commit})"
